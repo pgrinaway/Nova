@@ -368,6 +368,8 @@ where
       None,
       None,
       None,
+      None,
+      None,
       ri_primary, // "r next"
       None,
       None,
@@ -389,6 +391,8 @@ where
       pp.digest(),
       E2::Scalar::ZERO,
       vec![E2::Scalar::ZERO],
+      None,
+      None,
       None,
       None,
       None,
@@ -482,6 +486,8 @@ where
       Some(self.zi.clone()),
       Some(self.r_U_secondary.clone()),
       Some(self.ri_primary),
+      Some(self.r_U_secondary.clone()),
+      Some(self.ri_primary),
       r_next_primary,
       Some(self.l_u_secondary.clone()),
       Some(nifs_secondary.comm_T),
@@ -518,6 +524,8 @@ where
       E2::Scalar::from(self.i as u64),
       vec![E2::Scalar::ZERO],
       Some(vec![E2::Scalar::ZERO]),
+      Some(self.r_U_primary.clone()),
+      Some(self.ri_secondary),
       Some(self.r_U_primary.clone()),
       Some(self.ri_secondary),
       r_next_secondary,
@@ -607,12 +615,16 @@ where
       }
       self.r_U_secondary.absorb_in_ro(&mut hasher);
       hasher.absorb(self.ri_primary);
+      self.r_U_secondary.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.ri_primary);
 
       let mut hasher2 = <E1 as Engine>::RO::new(pp.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(pp.digest()));
       hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
+      self.r_U_primary.absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.ri_secondary);
       self.r_U_primary.absorb_in_ro(&mut hasher2);
       hasher2.absorb(self.ri_secondary);
 
@@ -944,12 +956,16 @@ where
       }
       self.r_U_secondary.absorb_in_ro(&mut hasher);
       hasher.absorb(self.ri_primary);
+      self.r_U_secondary.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.ri_primary);
 
       let mut hasher2 = <E1 as Engine>::RO::new(vk.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(vk.pp_digest));
       hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
+      self.r_U_primary.absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.ri_secondary);
       self.r_U_primary.absorb_in_ro(&mut hasher2);
       hasher2.absorb(self.ri_secondary);
 
