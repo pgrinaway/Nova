@@ -1,7 +1,8 @@
 //! There are two augmented circuits: the primary and the secondary.
 //! Each of them is over a curve in a 2-cycle of elliptic curves.
 //! We have two running instances. Each circuit takes as input 2 hashes: one for each
-//! of the running instances. Each of these hashes is H(params = H(shape, ck), i, z0, zi, U).
+//! of the running instances. Each of these hashes is
+//! H(params = H(shape, ck), i, z0, zi, U_left, r_left, U_right, r_right).
 //! Each circuit folds the last invocation of the other into the running instance
 
 use crate::{
@@ -34,8 +35,10 @@ pub struct NovaAugmentedCircuitInputs<E: Engine> {
   i: E::Base,
   z0: Vec<E::Base>,
   zi: Option<Vec<E::Base>>,
-  U: Option<RelaxedR1CSInstance<E>>,
-  ri: Option<E::Base>,
+  U_left: Option<RelaxedR1CSInstance<E>>,
+  r_left: Option<E::Base>,
+  U_right: Option<RelaxedR1CSInstance<E>>,
+  r_right: Option<E::Base>,
   r_next: E::Base,
   u: Option<R1CSInstance<E>>,
   T: Option<Commitment<E>>,
@@ -48,8 +51,10 @@ impl<E: Engine> NovaAugmentedCircuitInputs<E> {
     i: E::Base,
     z0: Vec<E::Base>,
     zi: Option<Vec<E::Base>>,
-    U: Option<RelaxedR1CSInstance<E>>,
-    ri: Option<E::Base>,
+    U_left: Option<RelaxedR1CSInstance<E>>,
+    r_left: Option<E::Base>,
+    U_right: Option<RelaxedR1CSInstance<E>>,
+    r_right: Option<E::Base>,
     r_next: E::Base,
     u: Option<R1CSInstance<E>>,
     T: Option<Commitment<E>>,
@@ -59,8 +64,10 @@ impl<E: Engine> NovaAugmentedCircuitInputs<E> {
       i,
       z0,
       zi,
-      U,
-      ri,
+      U_left,
+      r_left,
+      U_right,
+      r_right,
       r_next,
       u,
       T,
@@ -106,6 +113,8 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
       Vec<AllocatedNum<E::Base>>,
       AllocatedRelaxedR1CSInstance<E>,
       AllocatedNum<E::Base>,
+      AllocatedRelaxedR1CSInstance<E>,
+      AllocatedNum<E::Base>,
       AllocatedNum<E::Base>,
       AllocatedR1CSInstance<E>,
       AllocatedPoint<E>,
@@ -140,15 +149,32 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
       })
       .collect::<Result<Vec<AllocatedNum<E::Base>>, _>>()?;
 
-    // Allocate the running instance
-    let U: AllocatedRelaxedR1CSInstance<E> = AllocatedRelaxedR1CSInstance::alloc(
-      cs.namespace(|| "Allocate U"),
-      self.inputs.as_ref().and_then(|inputs| inputs.U.as_ref()),
+    // Allocate the left child instance
+    let U_left: AllocatedRelaxedR1CSInstance<E> = AllocatedRelaxedR1CSInstance::alloc(
+      cs.namespace(|| "Allocate U_left"),
+      self
+        .inputs
+        .as_ref()
+        .and_then(|inputs| inputs.U_left.as_ref()),
     )?;
 
-    // Allocate ri
-    let r_i = AllocatedNum::alloc(cs.namespace(|| "ri"), || {
-      Ok(self.inputs.get()?.ri.unwrap_or(E::Base::ZERO))
+    // Allocate r_left
+    let r_left = AllocatedNum::alloc(cs.namespace(|| "r_left"), || {
+      Ok(self.inputs.get()?.r_left.unwrap_or(E::Base::ZERO))
+    })?;
+
+    // Allocate the right child instance
+    let U_right: AllocatedRelaxedR1CSInstance<E> = AllocatedRelaxedR1CSInstance::alloc(
+      cs.namespace(|| "Allocate U_right"),
+      self
+        .inputs
+        .as_ref()
+        .and_then(|inputs| inputs.U_right.as_ref()),
+    )?;
+
+    // Allocate r_right
+    let r_right = AllocatedNum::alloc(cs.namespace(|| "r_right"), || {
+      Ok(self.inputs.get()?.r_right.unwrap_or(E::Base::ZERO))
     })?;
 
     // Allocate r_i+1
@@ -170,7 +196,9 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
     )?;
     T.check_on_curve(cs.namespace(|| "check T on curve"))?;
 
-    Ok((pp_digest, i, z_0, z_i, U, r_i, r_next, u, T))
+    Ok((
+      pp_digest, i, z_0, z_i, U_left, r_left, U_right, r_right, r_next, u, T,
+    ))
   }
 
   fn synthesize_hash_check<CS: ConstraintSystem<E::Base>>(
@@ -180,10 +208,12 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
     i: &AllocatedNum<E::Base>,
     z_0: &[AllocatedNum<E::Base>],
     z_i: &[AllocatedNum<E::Base>],
-    U: &AllocatedRelaxedR1CSInstance<E>,
-    r_i: &AllocatedNum<E::Base>,
+    U_left: &AllocatedRelaxedR1CSInstance<E>,
+    r_left: &AllocatedNum<E::Base>,
+    U_right: &AllocatedRelaxedR1CSInstance<E>,
+    r_right: &AllocatedNum<E::Base>,
   ) -> Result<AllocatedNum<E::Base>, SynthesisError> {
-    // Check that u.x[0] = Hash(pp_digest, i, z_0, z_i, U, r_i)
+    // Check that u.x[0] = Hash(pp_digest, i, z_0, z_i, U_left, r_left, U_right, r_right)
     let mut ro = E::ROCircuit::new(self.ro_consts.clone());
     ro.absorb(pp_digest);
     ro.absorb(i);
@@ -193,8 +223,10 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
     for e in z_i {
       ro.absorb(e);
     }
-    U.absorb_in_ro(cs.namespace(|| "absorb U"), &mut ro)?;
-    ro.absorb(r_i);
+    U_left.absorb_in_ro(cs.namespace(|| "absorb U_left"), &mut ro)?;
+    ro.absorb(r_left);
+    U_right.absorb_in_ro(cs.namespace(|| "absorb U_right"), &mut ro)?;
+    ro.absorb(r_right);
 
     let hash_bits = ro.squeeze(cs.namespace(|| "Input hash"), NUM_HASH_BITS, false)?;
     let hash = le_bits_to_num(cs.namespace(|| "bits to hash"), &hash_bits)?;
@@ -224,12 +256,12 @@ impl<'a, E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'a, E, SC> {
     &self,
     mut cs: CS,
     pp_digest: &AllocatedNum<E::Base>,
-    U: &AllocatedRelaxedR1CSInstance<E>,
+    U_left: &AllocatedRelaxedR1CSInstance<E>,
     u: &AllocatedR1CSInstance<E>,
     T: &AllocatedPoint<E>,
   ) -> Result<AllocatedRelaxedR1CSInstance<E>, SynthesisError> {
     // Run NIFS Verifier
-    let U_fold = U.fold_with_r1cs(
+    let U_fold = U_left.fold_with_r1cs_pair(
       cs.namespace(|| "compute fold of U and u"),
       pp_digest,
       u,
@@ -250,7 +282,7 @@ impl<E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'_, E, SC> {
     let arity = self.step_circuit.arity();
 
     // Allocate all witnesses
-    let (pp_digest, i, z_0, z_i, U, r_i, r_next, u, T) =
+    let (pp_digest, i, z_0, z_i, U_left, r_left, U_right, r_right, r_next, u, T) =
       self.alloc_witness(cs.namespace(|| "allocate the circuit witness"), arity)?;
 
     // Compute variable indicating if this is the base case
@@ -264,8 +296,10 @@ impl<E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'_, E, SC> {
       &i,
       &z_0,
       &z_i,
-      &U,
-      &r_i,
+      &U_left,
+      &r_left,
+      &U_right,
+      &r_right,
     )?;
 
     let check_non_base_pass = alloc_num_equals(
@@ -282,7 +316,7 @@ impl<E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'_, E, SC> {
     let Unew_non_base = self.synthesize_non_base_case(
       cs.namespace(|| "synthesize non base case"),
       &pp_digest,
-      &U,
+      &U_left,
       &u,
       &T,
     )?;
@@ -345,6 +379,8 @@ impl<E: Engine, SC: StepCircuit<E::Base>> NovaAugmentedCircuit<'_, E, SC> {
       &z_next,
       &Unew,
       &r_next,
+      &U_right,
+      &r_right,
     )?;
 
     // Outputs the computed hash and u.X[1] that corresponds to the hash of the other circuit
@@ -415,6 +451,8 @@ mod tests {
       None,
       None,
       None,
+      None,
+      None,
       ri_1,
       None,
       None,
@@ -434,6 +472,8 @@ mod tests {
       scalar_as_base::<E2>(zero2), // pass zero for testing
       zero2,
       vec![zero2],
+      None,
+      None,
       None,
       None,
       None,
