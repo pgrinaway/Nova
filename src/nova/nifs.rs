@@ -72,6 +72,52 @@ impl<E: Engine> NIFS<E> {
     Ok((Self { comm_T }, (U, W)))
   }
 
+  /// Takes as input a pair of instance-witness tuples `(U_left, W_left)` and
+  /// `(U_right, W_right)` with the same structure `shape` and defined with
+  /// respect to the same `ck`, and outputs a folded Relaxed R1CS
+  /// instance-witness tuple `(U, W)` of the same shape `shape`, with the
+  /// guarantee that the folded witness `W` satisfies the folded instance `U`
+  /// if and only if `W_left` satisfies `U_left` and `W_right` satisfies `U_right`.
+  pub fn prove_pair(
+    ck: &CommitmentKey<E>,
+    ro_consts: &ROConstants<E>,
+    pp_digest: &E::Scalar,
+    S: &R1CSShape<E>,
+    U_left: &RelaxedR1CSInstance<E>,
+    W_left: &RelaxedR1CSWitness<E>,
+    U_right: &R1CSInstance<E>,
+    W_right: &R1CSWitness<E>,
+  ) -> Result<(NIFS<E>, (RelaxedR1CSInstance<E>, RelaxedR1CSWitness<E>)), NovaError> {
+    // initialize a new RO
+    let mut ro = E::RO::new(ro_consts.clone());
+
+    // append the digest of pp to the transcript
+    ro.absorb(scalar_as_base::<E>(*pp_digest));
+
+    // append both inputs to the transcript
+    U_left.absorb_in_ro(&mut ro);
+    U_right.absorb_in_ro(&mut ro);
+
+    // compute a commitment to the cross-term
+    let r_T = E::Scalar::random(&mut OsRng);
+    let (T, comm_T) = S.commit_T(ck, U_left, W_left, U_right, W_right, &r_T)?;
+
+    // append `comm_T` to the transcript and obtain a challenge
+    comm_T.absorb_in_ro(&mut ro);
+
+    // compute a challenge from the RO
+    let r = base_as_scalar::<E>(ro.squeeze(NUM_CHALLENGE_BITS, false));
+
+    // fold the instance using `r` and `comm_T`
+    let U = U_left.fold(U_right, &comm_T, &r);
+
+    // fold the witness using `r` and `T`
+    let W = W_left.fold(W_right, &T, &r_T, &r)?;
+
+    // return the folded instance and witness
+    Ok((Self { comm_T }, (U, W)))
+  }
+
   /// Takes as input a relaxed R1CS instance `U1` and R1CS instance `U2`
   /// with the same shape and defined with respect to the same parameters,
   /// and outputs a folded instance `U` with the same shape,
@@ -101,6 +147,41 @@ impl<E: Engine> NIFS<E> {
 
     // fold the instance using `r` and `comm_T`
     let U = U1.fold(U2, &self.comm_T, &base_as_scalar::<E>(r));
+
+    // return the folded instance
+    Ok(U)
+  }
+
+  /// Takes as input a relaxed R1CS instance `U_left` and R1CS instance
+  /// `U_right` with the same shape and defined with respect to the same
+  /// parameters, and outputs a folded instance `U` with the same shape,
+  /// with the guarantee that the folded instance `U` is satisfiable
+  /// if and only if `U_left` and `U_right` are satisfiable.
+  pub fn verify_pair(
+    &self,
+    ro_consts: &ROConstants<E>,
+    pp_digest: &E::Scalar,
+    U_left: &RelaxedR1CSInstance<E>,
+    U_right: &R1CSInstance<E>,
+  ) -> Result<RelaxedR1CSInstance<E>, NovaError> {
+    // initialize a new RO
+    let mut ro = E::RO::new(ro_consts.clone());
+
+    // append the digest of pp to the transcript
+    ro.absorb(scalar_as_base::<E>(*pp_digest));
+
+    // append both inputs to the transcript
+    U_left.absorb_in_ro(&mut ro);
+    U_right.absorb_in_ro(&mut ro);
+
+    // append `comm_T` to the transcript and obtain a challenge
+    self.comm_T.absorb_in_ro(&mut ro);
+
+    // compute a challenge from the RO
+    let r = ro.squeeze(NUM_CHALLENGE_BITS, false);
+
+    // fold the instance using `r` and `comm_T`
+    let U = U_left.fold(U_right, &self.comm_T, &base_as_scalar::<E>(r));
 
     // return the folded instance
     Ok(U)

@@ -795,7 +795,7 @@ where
     // prove three foldings
 
     // fold secondary U/W with secondary u/w to get Uf/Wf
-    let (nifs_Uf_secondary, (r_Uf_secondary, r_Wf_secondary)) = NIFS::prove(
+    let (nifs_Uf_secondary, (r_Uf_secondary, r_Wf_secondary)) = NIFS::prove_pair(
       &pp.ck_secondary,
       &pp.ro_consts_secondary,
       &scalar_as_base::<E1>(pp.digest()),
@@ -968,7 +968,7 @@ where
     }
 
     // fold secondary U/W with secondary u/w to get Uf/Wf
-    let r_Uf_secondary = self.nifs_Uf_secondary.verify(
+    let r_Uf_secondary = self.nifs_Uf_secondary.verify_pair(
       &vk.ro_consts_secondary,
       &scalar_as_base::<E1>(vk.pp_digest),
       &self.r_U_secondary,
