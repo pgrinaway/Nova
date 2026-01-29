@@ -21,7 +21,7 @@ use crate::{
     snark::RelaxedR1CSSNARKTrait,
     AbsorbInROTrait, Engine, ROConstants, ROConstantsCircuit, ROTrait,
   },
-  CommitmentKey, DerandKey,
+  Commitment, CommitmentKey, DerandKey,
 };
 use core::marker::PhantomData;
 use ff::Field;
@@ -659,6 +659,146 @@ where
     Ok((l_u_primary, l_w_primary))
   }
 
+  fn derive_pair_primary_instance(
+    pp: &PublicParams<E1, E2, C>,
+    c: &C,
+    left: &Self,
+    right: &Self,
+    u_secondary: &R1CSInstance<E2>,
+    comm_t: Commitment<E2>,
+    r_next_primary: E1::Scalar,
+  ) -> Result<(Vec<E1::Scalar>, R1CSInstance<E1>, R1CSWitness<E1>), NovaError> {
+    let mut cs_primary = SatisfyingAssignment::<E1>::new();
+    let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
+      scalar_as_base::<E1>(pp.digest()),
+      E1::Scalar::from(left.i as u64),
+      left.z0.clone(),
+      Some(left.zi.clone()),
+      Some(left.r_U_secondary.clone()),
+      Some(left.ri_primary),
+      Some(right.r_U_secondary.clone()),
+      Some(right.ri_primary),
+      r_next_primary,
+      Some(u_secondary.clone()),
+      Some(comm_t),
+    );
+
+    let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
+      true,
+      Some(inputs_primary),
+      c,
+      pp.ro_consts_circuit_primary.clone(),
+    );
+    let zi_primary = circuit_primary.synthesize(&mut cs_primary)?;
+
+    let (l_u_primary, l_w_primary) =
+      cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary)?;
+
+    if zi_primary.len() != pp.F_arity {
+      return Err(NovaError::InvalidStepOutputLength);
+    }
+
+    let zi_primary = zi_primary
+      .iter()
+      .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))
+      .collect::<Result<Vec<<E1 as Engine>::Scalar>, _>>()?;
+
+    Ok((zi_primary, l_u_primary, l_w_primary))
+  }
+
+  fn derive_pair_secondary_instance(
+    pp: &PublicParams<E1, E2, C>,
+    left: &Self,
+    right: &Self,
+    u_primary: &R1CSInstance<E1>,
+    comm_t: Commitment<E1>,
+    r_next_secondary: E2::Scalar,
+  ) -> Result<(R1CSInstance<E2>, R1CSWitness<E2>), NovaError> {
+    let mut cs_secondary = SatisfyingAssignment::<E2>::new();
+    let inputs_secondary: NovaAugmentedCircuitInputs<E1> = NovaAugmentedCircuitInputs::new(
+      pp.digest(),
+      E2::Scalar::from(left.i as u64),
+      vec![E2::Scalar::ZERO],
+      Some(vec![E2::Scalar::ZERO]),
+      Some(left.r_U_primary.clone()),
+      Some(left.ri_secondary),
+      Some(right.r_U_primary.clone()),
+      Some(right.ri_secondary),
+      r_next_secondary,
+      Some(u_primary.clone()),
+      Some(comm_t),
+    );
+
+    let tc = TrivialCircuit::<E2::Scalar>::default();
+    let circuit_secondary: NovaAugmentedCircuit<'_, E1, _> = NovaAugmentedCircuit::new(
+      false,
+      Some(inputs_secondary),
+      &tc,
+      pp.ro_consts_circuit_secondary.clone(),
+    );
+    let _ = circuit_secondary.synthesize(&mut cs_secondary)?;
+
+    cs_secondary
+      .r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary)
+      .map_err(|_e| NovaError::UnSat {
+        reason: "Unable to generate a satisfying witness on the secondary curve".to_string(),
+      })
+  }
+
+  fn compute_pair_hashes(
+    pp: &PublicParams<E1, E2, C>,
+    left: &Self,
+    right: &Self,
+  ) -> (E1::Scalar, E2::Scalar) {
+    let mut hasher = <E2 as Engine>::RO::new(pp.ro_consts_secondary.clone());
+    hasher.absorb(pp.digest());
+    hasher.absorb(E1::Scalar::from(left.i as u64));
+    for e in &left.z0 {
+      hasher.absorb(*e);
+    }
+    for e in &left.zi {
+      hasher.absorb(*e);
+    }
+    left.r_U_secondary.absorb_in_ro(&mut hasher);
+    hasher.absorb(left.ri_primary);
+    right.r_U_secondary.absorb_in_ro(&mut hasher);
+    hasher.absorb(right.ri_primary);
+
+    let mut hasher2 = <E1 as Engine>::RO::new(pp.ro_consts_primary.clone());
+    hasher2.absorb(scalar_as_base::<E1>(pp.digest()));
+    hasher2.absorb(E2::Scalar::from(left.i as u64));
+    hasher2.absorb(E2::Scalar::ZERO);
+    hasher2.absorb(E2::Scalar::ZERO);
+    left.r_U_primary.absorb_in_ro(&mut hasher2);
+    hasher2.absorb(left.ri_secondary);
+    right.r_U_primary.absorb_in_ro(&mut hasher2);
+    hasher2.absorb(right.ri_secondary);
+
+    (
+      hasher.squeeze(NUM_HASH_BITS, false),
+      hasher2.squeeze(NUM_HASH_BITS, false),
+    )
+  }
+
+  fn rebind_instance_outputs<E: Engine>(
+    instance: &R1CSInstance<E>,
+    x0: E::Scalar,
+    x1: Option<E::Scalar>,
+  ) -> Result<R1CSInstance<E>, NovaError> {
+    if instance.X.is_empty() || (x1.is_some() && instance.X.len() < 2) {
+      return Err(NovaError::ProofVerifyError {
+        reason: "R1CS instance has no public outputs".to_string(),
+      });
+    }
+
+    let mut rebound = instance.clone();
+    rebound.X[0] = x0;
+    if let Some(x1) = x1 {
+      rebound.X[1] = x1;
+    }
+    Ok(rebound)
+  }
+
   /// Combine two child RecursiveSNARKs using a pairwise fold.
   pub fn combine(
     pp: &PublicParams<E1, E2, C>,
@@ -675,48 +815,20 @@ where
     left.verify(pp, left.i, &left.z0)?;
     right.verify(pp, right.i, &right.z0)?;
 
+    let (pair_hash_primary, pair_hash_secondary) = Self::compute_pair_hashes(pp, left, right);
+
     let (right_l_u_primary, right_l_w_primary) = Self::derive_primary_instance(pp, c, right)?;
 
-    let (nifs_secondary, (r_U_secondary, r_W_secondary)) = NIFS::prove_pair(
-      &pp.ck_secondary,
-      &pp.ro_consts_secondary,
-      &scalar_as_base::<E1>(pp.digest()),
-      &pp.r1cs_shape_secondary,
-      &left.r_U_secondary,
-      &left.r_W_secondary,
-      &right.l_u_secondary,
-      &right.l_w_secondary,
+    let u_primary_input = Self::rebind_instance_outputs(
+      &right_l_u_primary,
+      base_as_scalar::<E1>(pair_hash_secondary),
+      Some(pair_hash_primary),
     )?;
 
     let r_next_primary = E1::Scalar::random(&mut OsRng);
+    let r_next_secondary = E2::Scalar::random(&mut OsRng);
 
-    let mut cs_primary = SatisfyingAssignment::<E1>::new();
-    let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
-      scalar_as_base::<E1>(pp.digest()),
-      E1::Scalar::from(left.i as u64),
-      left.z0.clone(),
-      Some(left.zi.clone()),
-      Some(left.r_U_secondary.clone()),
-      Some(left.ri_primary),
-      Some(right.r_U_secondary.clone()),
-      Some(right.ri_primary),
-      r_next_primary,
-      Some(right.l_u_secondary.clone()),
-      Some(nifs_secondary.comm_T),
-    );
-
-    let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
-      true,
-      Some(inputs_primary),
-      c,
-      pp.ro_consts_circuit_primary.clone(),
-    );
-    let zi_primary = circuit_primary.synthesize(&mut cs_primary)?;
-
-    let (l_u_primary, _l_w_primary) =
-      cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary)?;
-
-    let (nifs_primary, (r_U_primary, r_W_primary)) = NIFS::prove_pair(
+    let (nifs_primary_seed, _) = NIFS::prove_pair(
       &pp.ck_primary,
       &pp.ro_consts_primary,
       &pp.digest(),
@@ -727,7 +839,46 @@ where
       &right_l_w_primary,
     )?;
 
-    let r_next_secondary = E2::Scalar::random(&mut OsRng);
+    let (pair_l_u_secondary, pair_l_w_secondary) = Self::derive_pair_secondary_instance(
+      pp,
+      left,
+      right,
+      &u_primary_input,
+      nifs_primary_seed.comm_T,
+      r_next_secondary,
+    )?;
+
+    let (nifs_secondary, (r_U_secondary, r_W_secondary)) = NIFS::prove_pair(
+      &pp.ck_secondary,
+      &pp.ro_consts_secondary,
+      &scalar_as_base::<E1>(pp.digest()),
+      &pp.r1cs_shape_secondary,
+      &left.r_U_secondary,
+      &left.r_W_secondary,
+      &pair_l_u_secondary,
+      &pair_l_w_secondary,
+    )?;
+
+    let (zi_primary, l_u_primary, l_w_primary) = Self::derive_pair_primary_instance(
+      pp,
+      c,
+      left,
+      right,
+      &pair_l_u_secondary,
+      nifs_secondary.comm_T,
+      r_next_primary,
+    )?;
+
+    let (nifs_primary, (r_U_primary, r_W_primary)) = NIFS::prove_pair(
+      &pp.ck_primary,
+      &pp.ro_consts_primary,
+      &pp.digest(),
+      &pp.r1cs_shape_primary,
+      &left.r_U_primary,
+      &left.r_W_primary,
+      &l_u_primary,
+      &l_w_primary,
+    )?;
 
     let mut cs_secondary = SatisfyingAssignment::<E2>::new();
     let inputs_secondary: NovaAugmentedCircuitInputs<E1> = NovaAugmentedCircuitInputs::new(
@@ -755,15 +906,6 @@ where
 
     let (l_u_secondary, l_w_secondary) =
       cs_secondary.r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary)?;
-
-    if zi_primary.len() != pp.F_arity {
-      return Err(NovaError::InvalidStepOutputLength);
-    }
-
-    let zi_primary = zi_primary
-      .iter()
-      .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))
-      .collect::<Result<Vec<<E1 as Engine>::Scalar>, _>>()?;
 
     Ok(Self {
       z0: left.z0.clone(),
