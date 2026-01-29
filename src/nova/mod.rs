@@ -337,11 +337,23 @@ where
   l_w_secondary: R1CSWitness<E2>,
   l_u_secondary: R1CSInstance<E2>,
 
+  hash_inputs_primary: HashInputs<E2>,
+  hash_inputs_secondary: HashInputs<E1>,
+
   i: usize,
 
   zi: Vec<E1::Scalar>,
 
   _p: PhantomData<C>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+struct HashInputs<E: Engine> {
+  U_left: RelaxedR1CSInstance<E>,
+  r_left: E::Base,
+  U_right: RelaxedR1CSInstance<E>,
+  r_right: E::Base,
 }
 
 impl<E1, E2, C> RecursiveSNARK<E1, E2, C>
@@ -438,15 +450,28 @@ where
       z0: z0.to_vec(),
 
       r_W_primary,
-      r_U_primary,
+      r_U_primary: r_U_primary.clone(),
       ri_primary,
 
       r_W_secondary,
-      r_U_secondary,
+      r_U_secondary: r_U_secondary.clone(),
       ri_secondary,
 
       l_w_secondary,
       l_u_secondary,
+
+      hash_inputs_primary: HashInputs {
+        U_left: r_U_secondary.clone(),
+        r_left: ri_primary,
+        U_right: r_U_secondary.clone(),
+        r_right: E1::Scalar::ZERO,
+      },
+      hash_inputs_secondary: HashInputs {
+        U_left: r_U_primary.clone(),
+        r_left: ri_secondary,
+        U_right: RelaxedR1CSInstance::<E1>::default(&pp.ck_primary, &pp.r1cs_shape_primary),
+        r_right: E2::Scalar::ZERO,
+      },
 
       i: 0,
 
@@ -463,6 +488,11 @@ where
       self.i = 1;
       return Ok(());
     }
+
+    let prev_r_U_secondary = self.r_U_secondary.clone();
+    let prev_ri_primary = self.ri_primary;
+    let prev_r_U_primary = self.r_U_primary.clone();
+    let prev_ri_secondary = self.ri_secondary;
 
     // fold the secondary circuit's instance
     let (nifs_secondary, (r_U_secondary, r_W_secondary)) = NIFS::prove(
@@ -568,7 +598,206 @@ where
     self.ri_primary = r_next_primary;
     self.ri_secondary = r_next_secondary;
 
+    self.hash_inputs_primary = HashInputs {
+      U_left: self.r_U_secondary.clone(),
+      r_left: self.ri_primary,
+      U_right: prev_r_U_secondary,
+      r_right: prev_ri_primary,
+    };
+    self.hash_inputs_secondary = HashInputs {
+      U_left: self.r_U_primary.clone(),
+      r_left: self.ri_secondary,
+      U_right: prev_r_U_primary,
+      r_right: prev_ri_secondary,
+    };
+
     Ok(())
+  }
+
+  fn derive_primary_instance(
+    pp: &PublicParams<E1, E2, C>,
+    c: &C,
+    child: &Self,
+  ) -> Result<(R1CSInstance<E1>, R1CSWitness<E1>), NovaError> {
+    let (nifs_secondary, _) = NIFS::prove(
+      &pp.ck_secondary,
+      &pp.ro_consts_secondary,
+      &scalar_as_base::<E1>(pp.digest()),
+      &pp.r1cs_shape_secondary,
+      &child.r_U_secondary,
+      &child.r_W_secondary,
+      &child.l_u_secondary,
+      &child.l_w_secondary,
+    )?;
+
+    let mut cs_primary = SatisfyingAssignment::<E1>::new();
+    let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
+      scalar_as_base::<E1>(pp.digest()),
+      E1::Scalar::from(child.i as u64),
+      child.z0.clone(),
+      Some(child.zi.clone()),
+      Some(child.r_U_secondary.clone()),
+      Some(child.ri_primary),
+      Some(child.r_U_secondary.clone()),
+      Some(child.ri_primary),
+      child.ri_primary,
+      Some(child.l_u_secondary.clone()),
+      Some(nifs_secondary.comm_T),
+    );
+
+    let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
+      true,
+      Some(inputs_primary),
+      c,
+      pp.ro_consts_circuit_primary.clone(),
+    );
+    let _ = circuit_primary.synthesize(&mut cs_primary)?;
+
+    let (l_u_primary, l_w_primary) =
+      cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary)?;
+
+    Ok((l_u_primary, l_w_primary))
+  }
+
+  /// Combine two child RecursiveSNARKs using a pairwise fold.
+  pub fn combine(
+    pp: &PublicParams<E1, E2, C>,
+    c: &C,
+    left: &Self,
+    right: &Self,
+  ) -> Result<Self, NovaError> {
+    if left.i != right.i || left.z0 != right.z0 || left.zi != right.zi {
+      return Err(NovaError::ProofVerifyError {
+        reason: "Child RecursiveSNARKs have mismatched state".to_string(),
+      });
+    }
+
+    left.verify(pp, left.i, &left.z0)?;
+    right.verify(pp, right.i, &right.z0)?;
+
+    let (right_l_u_primary, right_l_w_primary) = Self::derive_primary_instance(pp, c, right)?;
+
+    let (nifs_secondary, (r_U_secondary, r_W_secondary)) = NIFS::prove_pair(
+      &pp.ck_secondary,
+      &pp.ro_consts_secondary,
+      &scalar_as_base::<E1>(pp.digest()),
+      &pp.r1cs_shape_secondary,
+      &left.r_U_secondary,
+      &left.r_W_secondary,
+      &right.l_u_secondary,
+      &right.l_w_secondary,
+    )?;
+
+    let r_next_primary = E1::Scalar::random(&mut OsRng);
+
+    let mut cs_primary = SatisfyingAssignment::<E1>::new();
+    let inputs_primary: NovaAugmentedCircuitInputs<E2> = NovaAugmentedCircuitInputs::new(
+      scalar_as_base::<E1>(pp.digest()),
+      E1::Scalar::from(left.i as u64),
+      left.z0.clone(),
+      Some(left.zi.clone()),
+      Some(left.r_U_secondary.clone()),
+      Some(left.ri_primary),
+      Some(right.r_U_secondary.clone()),
+      Some(right.ri_primary),
+      r_next_primary,
+      Some(right.l_u_secondary.clone()),
+      Some(nifs_secondary.comm_T),
+    );
+
+    let circuit_primary: NovaAugmentedCircuit<'_, E2, C> = NovaAugmentedCircuit::new(
+      true,
+      Some(inputs_primary),
+      c,
+      pp.ro_consts_circuit_primary.clone(),
+    );
+    let zi_primary = circuit_primary.synthesize(&mut cs_primary)?;
+
+    let (l_u_primary, _l_w_primary) =
+      cs_primary.r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary)?;
+
+    let (nifs_primary, (r_U_primary, r_W_primary)) = NIFS::prove_pair(
+      &pp.ck_primary,
+      &pp.ro_consts_primary,
+      &pp.digest(),
+      &pp.r1cs_shape_primary,
+      &left.r_U_primary,
+      &left.r_W_primary,
+      &right_l_u_primary,
+      &right_l_w_primary,
+    )?;
+
+    let r_next_secondary = E2::Scalar::random(&mut OsRng);
+
+    let mut cs_secondary = SatisfyingAssignment::<E2>::new();
+    let inputs_secondary: NovaAugmentedCircuitInputs<E1> = NovaAugmentedCircuitInputs::new(
+      pp.digest(),
+      E2::Scalar::from(left.i as u64),
+      vec![E2::Scalar::ZERO],
+      Some(vec![E2::Scalar::ZERO]),
+      Some(left.r_U_primary.clone()),
+      Some(left.ri_secondary),
+      Some(right.r_U_primary.clone()),
+      Some(right.ri_secondary),
+      r_next_secondary,
+      Some(l_u_primary.clone()),
+      Some(nifs_primary.comm_T),
+    );
+
+    let tc = TrivialCircuit::<E2::Scalar>::default();
+    let circuit_secondary: NovaAugmentedCircuit<'_, E1, _> = NovaAugmentedCircuit::new(
+      false,
+      Some(inputs_secondary),
+      &tc,
+      pp.ro_consts_circuit_secondary.clone(),
+    );
+    let _ = circuit_secondary.synthesize(&mut cs_secondary)?;
+
+    let (l_u_secondary, l_w_secondary) =
+      cs_secondary.r1cs_instance_and_witness(&pp.r1cs_shape_secondary, &pp.ck_secondary)?;
+
+    if zi_primary.len() != pp.F_arity {
+      return Err(NovaError::InvalidStepOutputLength);
+    }
+
+    let zi_primary = zi_primary
+      .iter()
+      .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))
+      .collect::<Result<Vec<<E1 as Engine>::Scalar>, _>>()?;
+
+    Ok(Self {
+      z0: left.z0.clone(),
+
+      r_W_primary,
+      r_U_primary: r_U_primary.clone(),
+      ri_primary: r_next_primary,
+
+      r_W_secondary,
+      r_U_secondary: r_U_secondary.clone(),
+      ri_secondary: r_next_secondary,
+
+      l_w_secondary,
+      l_u_secondary,
+
+      hash_inputs_primary: HashInputs {
+        U_left: r_U_secondary,
+        r_left: r_next_primary,
+        U_right: right.r_U_secondary.clone(),
+        r_right: right.ri_primary,
+      },
+      hash_inputs_secondary: HashInputs {
+        U_left: r_U_primary,
+        r_left: r_next_secondary,
+        U_right: right.r_U_primary.clone(),
+        r_right: right.ri_secondary,
+      },
+
+      i: left.i + 1,
+
+      zi: zi_primary,
+
+      _p: Default::default(),
+    })
   }
 
   /// Verify the correctness of the `RecursiveSNARK`
@@ -613,20 +842,23 @@ where
       for e in &self.zi {
         hasher.absorb(*e);
       }
-      self.r_U_secondary.absorb_in_ro(&mut hasher);
-      hasher.absorb(self.ri_primary);
-      self.r_U_secondary.absorb_in_ro(&mut hasher);
-      hasher.absorb(self.ri_primary);
+      self.hash_inputs_primary.U_left.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.hash_inputs_primary.r_left);
+      self.hash_inputs_primary.U_right.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.hash_inputs_primary.r_right);
 
       let mut hasher2 = <E1 as Engine>::RO::new(pp.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(pp.digest()));
       hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
-      self.r_U_primary.absorb_in_ro(&mut hasher2);
-      hasher2.absorb(self.ri_secondary);
-      self.r_U_primary.absorb_in_ro(&mut hasher2);
-      hasher2.absorb(self.ri_secondary);
+      self.hash_inputs_secondary.U_left.absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.hash_inputs_secondary.r_left);
+      self
+        .hash_inputs_secondary
+        .U_right
+        .absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.hash_inputs_secondary.r_right);
 
       (
         hasher.squeeze(NUM_HASH_BITS, false),
@@ -740,6 +972,9 @@ where
   ri_secondary: E2::Scalar,
   l_u_secondary: R1CSInstance<E2>,
   nifs_Uf_secondary: NIFS<E2>,
+
+  hash_inputs_primary: HashInputs<E2>,
+  hash_inputs_secondary: HashInputs<E1>,
 
   l_ur_secondary: RelaxedR1CSInstance<E2>,
   nifs_Un_secondary: NIFSRelaxed<E2>,
@@ -895,6 +1130,9 @@ where
       l_u_secondary: recursive_snark.l_u_secondary.clone(),
       nifs_Uf_secondary: nifs_Uf_secondary.clone(),
 
+      hash_inputs_primary: recursive_snark.hash_inputs_primary.clone(),
+      hash_inputs_secondary: recursive_snark.hash_inputs_secondary.clone(),
+
       l_ur_secondary: l_ur_secondary.clone(),
       nifs_Un_secondary: nifs_Un_secondary.clone(),
 
@@ -954,20 +1192,23 @@ where
       for e in &self.zn {
         hasher.absorb(*e);
       }
-      self.r_U_secondary.absorb_in_ro(&mut hasher);
-      hasher.absorb(self.ri_primary);
-      self.r_U_secondary.absorb_in_ro(&mut hasher);
-      hasher.absorb(self.ri_primary);
+      self.hash_inputs_primary.U_left.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.hash_inputs_primary.r_left);
+      self.hash_inputs_primary.U_right.absorb_in_ro(&mut hasher);
+      hasher.absorb(self.hash_inputs_primary.r_right);
 
       let mut hasher2 = <E1 as Engine>::RO::new(vk.ro_consts_primary.clone());
       hasher2.absorb(scalar_as_base::<E1>(vk.pp_digest));
       hasher2.absorb(E2::Scalar::from(num_steps as u64));
       hasher2.absorb(E2::Scalar::ZERO);
       hasher2.absorb(E2::Scalar::ZERO);
-      self.r_U_primary.absorb_in_ro(&mut hasher2);
-      hasher2.absorb(self.ri_secondary);
-      self.r_U_primary.absorb_in_ro(&mut hasher2);
-      hasher2.absorb(self.ri_secondary);
+      self.hash_inputs_secondary.U_left.absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.hash_inputs_secondary.r_left);
+      self
+        .hash_inputs_secondary
+        .U_right
+        .absorb_in_ro(&mut hasher2);
+      hasher2.absorb(self.hash_inputs_secondary.r_right);
 
       (
         hasher.squeeze(NUM_HASH_BITS, false),
