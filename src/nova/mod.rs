@@ -780,14 +780,14 @@ where
       l_u_secondary,
 
       hash_inputs_primary: HashInputs {
-        U_left: r_U_secondary,
-        r_left: r_next_primary,
+        U_left: left.r_U_secondary.clone(),
+        r_left: left.ri_primary,
         U_right: right.r_U_secondary.clone(),
         r_right: right.ri_primary,
       },
       hash_inputs_secondary: HashInputs {
-        U_left: r_U_primary,
-        r_left: r_next_secondary,
+        U_left: left.r_U_primary.clone(),
+        r_left: left.ri_secondary,
         U_right: right.r_U_primary.clone(),
         r_right: right.ri_secondary,
       },
